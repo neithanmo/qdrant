@@ -1,4 +1,6 @@
 mod immutable_numeric_index;
+#[allow(dead_code)]
+mod mmap_numeric_index;
 mod mutable_numeric_index;
 
 #[cfg(test)]
