@@ -1,12 +1,10 @@
 use std::ops::Bound;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use bitvec::slice::BitSlice;
 use common::types::PointOffsetType;
-use parking_lot::RwLock;
-use rocksdb::DB;
 
+use super::mutable_numeric_index::DynamicNumericIndex;
 use super::Encodable;
 use crate::common::mmap_type::{MmapBitSlice, MmapSlice};
 use crate::common::operation_error::OperationResult;
@@ -20,7 +18,8 @@ const DELETED_PATH: &str = "deleted.json";
 pub struct MmapNumericIndex<T: Encodable + Numericable + Default + MmapValue + 'static> {
     path: PathBuf,
     deleted: MmapBitSlice,
-    map: MmapSlice<NumericIndexKey<T>>,
+    // sorted pairs (id + value), sorted by value (by id if values are equal)
+    map: MmapSlice<NumericIndexMmapPair<T>>,
     pub(super) histogram: Histogram<T>,
     pub(super) points_count: usize,
     pub(super) max_values_per_point: usize,
@@ -30,25 +29,25 @@ pub struct MmapNumericIndex<T: Encodable + Numericable + Default + MmapValue + '
 
 #[derive(Clone, PartialEq, Debug)]
 #[repr(C)]
-pub(super) struct NumericIndexKey<T> {
+pub(super) struct NumericIndexMmapPair<T> {
     key: T,
     point_id: PointOffsetType,
 }
 
-pub(super) struct NumericKeySortedVecIterator<'a, T: Encodable + Numericable> {
-    pairs: &'a [NumericIndexKey<T>],
+pub(super) struct NumericIndexPairsIterator<'a, T: Encodable + Numericable> {
+    pairs: &'a [NumericIndexMmapPair<T>],
     deleted: &'a BitSlice,
     start_index: usize,
     end_index: usize,
 }
 
-impl<T: PartialEq + PartialOrd + Encodable> PartialOrd for NumericIndexKey<T> {
+impl<T: PartialEq + PartialOrd + Encodable> PartialOrd for NumericIndexMmapPair<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T: PartialEq + PartialOrd + Encodable> Ord for NumericIndexKey<T> {
+impl<T: PartialEq + PartialOrd + Encodable> Ord for NumericIndexMmapPair<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match self.key.cmp_encoded(&other.key) {
             std::cmp::Ordering::Equal => self.point_id.cmp(&other.point_id),
@@ -57,10 +56,10 @@ impl<T: PartialEq + PartialOrd + Encodable> Ord for NumericIndexKey<T> {
     }
 }
 
-impl<T: PartialEq + PartialOrd + Encodable> Eq for NumericIndexKey<T> {}
+impl<T: PartialEq + PartialOrd + Encodable> Eq for NumericIndexMmapPair<T> {}
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a, T> {
-    type Item = NumericIndexKey<T>;
+impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, T> {
+    type Item = NumericIndexMmapPair<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
@@ -81,7 +80,7 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'a, T> {
+impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.pairs[self.end_index - 1].clone();
@@ -102,10 +101,18 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVec
 }
 
 impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
+    pub fn build(_dynamic_index: DynamicNumericIndex<T>, _path: &Path) -> OperationResult<Self> {
+        todo!()
+    }
+
+    pub fn load(_path: &Path) -> OperationResult<Self> {
+        todo!()
+    }
+
     pub fn files(&self) -> Vec<PathBuf> {
         let mut files = vec![self.path.join(PAIRS_PATH), self.path.join(DELETED_PATH)];
         files.extend(self.point_to_values.files());
-        files.extend(self.histogram.files(&self.path));
+        files.extend(Histogram::<T>::files(&self.path));
         files
     }
 
@@ -138,39 +145,37 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
 
     pub(super) fn values_range(
         &self,
-        start_bound: Bound<NumericIndexKey<T>>,
-        end_bound: Bound<NumericIndexKey<T>>,
+        start_bound: Bound<NumericIndexMmapPair<T>>,
+        end_bound: Bound<NumericIndexMmapPair<T>>,
     ) -> impl Iterator<Item = PointOffsetType> + '_ {
         self.values_range_iterator(start_bound, end_bound)
-            .map(|NumericIndexKey { point_id, .. }| point_id)
+            .map(|NumericIndexMmapPair { point_id, .. }| point_id)
     }
 
     pub(super) fn orderable_values_range(
         &self,
-        start_bound: Bound<NumericIndexKey<T>>,
-        end_bound: Bound<NumericIndexKey<T>>,
+        start_bound: Bound<NumericIndexMmapPair<T>>,
+        end_bound: Bound<NumericIndexMmapPair<T>>,
     ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
         self.values_range_iterator(start_bound, end_bound)
-            .map(|NumericIndexKey { key, point_id, .. }| (key, point_id))
+            .map(|NumericIndexMmapPair { key, point_id, .. }| (key, point_id))
     }
 
     pub(super) fn remove_point(&mut self, idx: PointOffsetType) {
-        self.deleted
-            .get_mut(idx as usize)
-            .as_deref_mut()
-            .map(|is_deleted| {
-                if !*is_deleted {
-                    self.deleted_count += 1;
-                    *is_deleted = true;
-                }
-            });
+        if let Some(is_deleted) = self.deleted.get_mut(idx as usize).as_deref_mut() {
+            if !*is_deleted {
+                self.deleted_count += 1;
+                *is_deleted = true;
+            }
+        }
     }
 
+    // get iterator
     fn values_range_iterator(
         &self,
-        start_bound: Bound<NumericIndexKey<T>>,
-        end_bound: Bound<NumericIndexKey<T>>,
-    ) -> NumericKeySortedVecIterator<'_, T> {
+        start_bound: Bound<NumericIndexMmapPair<T>>,
+        end_bound: Bound<NumericIndexMmapPair<T>>,
+    ) -> NumericIndexPairsIterator<'_, T> {
         let start_index = match start_bound {
             Bound::Included(bound) => self.map.binary_search(&bound).unwrap_or_else(|idx| idx),
             Bound::Excluded(bound) => match self.map.binary_search(&bound) {
@@ -181,7 +186,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         };
 
         if start_index >= self.map.len() {
-            return NumericKeySortedVecIterator {
+            return NumericIndexPairsIterator {
                 pairs: &self.map,
                 deleted: &self.deleted,
                 start_index: self.map.len(),
@@ -201,7 +206,7 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             Bound::Unbounded => self.map.len(),
         };
 
-        NumericKeySortedVecIterator {
+        NumericIndexPairsIterator {
             pairs: &self.map,
             deleted: &self.deleted,
             start_index,

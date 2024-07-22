@@ -176,7 +176,7 @@ impl<T: Numericable + Serialize + DeserializeOwned> Histogram<T> {
         Ok(())
     }
 
-    pub fn files(&self, path: &Path) -> Vec<PathBuf> {
+    pub fn files(path: &Path) -> Vec<PathBuf> {
         vec![path.join(CONFIG_PATH), path.join(BORDERS_PATH)]
     }
 
